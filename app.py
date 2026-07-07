@@ -162,6 +162,7 @@ h1,h2,h3,h4 {
 
 # --------------------------- CORE FUNCTIONS --------------------------------
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+DEFAULT_OPENAI_CHAT_MODEL = "gpt-5.5"
 
 
 def parse_ai_batch_response(response_text, original_batch):
@@ -453,6 +454,82 @@ def render_emoji_bars(emoji_ranking):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def build_chat_analysis_context(df, max_rows=220):
+    total_comments = len(df)
+    sentiment_counts = df["Sentiment"].value_counts().to_dict()
+    sentiment_percentages = {
+        sentiment: f"{(count / total_comments) * 100:.1f}%"
+        for sentiment, count in sentiment_counts.items()
+    }
+
+    sentiment_examples = []
+    for sentiment in ["Positive", "Negative", "Neutral"]:
+        subset = df[df["Sentiment"] == sentiment]
+        if subset.empty:
+            continue
+
+        comments = (
+            subset["Original Comment"]
+            .dropna()
+            .astype(str)
+            .head(15)
+            .tolist()
+        )
+        quoted_comments = "\n".join([f'- "{comment}"' for comment in comments])
+        sentiment_examples.append(f"{sentiment} examples:\n{quoted_comments}")
+
+    if total_comments <= max_rows:
+        sample_df = df.copy()
+        sample_note = "Full analyzed dataset included."
+    else:
+        chunks = []
+        per_sentiment = max(25, max_rows // 3)
+
+        for sentiment in ["Positive", "Negative", "Neutral"]:
+            subset = df[df["Sentiment"] == sentiment]
+            if not subset.empty:
+                chunks.append(subset.head(per_sentiment))
+
+        sample_df = pd.concat(chunks).drop_duplicates()
+        if len(sample_df) < max_rows:
+            remaining = max_rows - len(sample_df)
+            sample_df = pd.concat(
+                [
+                    sample_df,
+                    df.drop(index=sample_df.index, errors="ignore").head(remaining)
+                ]
+            ).drop_duplicates()
+
+        sample_note = (
+            f"Representative sample included: {len(sample_df)} "
+            f"of {total_comments} analyzed comments."
+        )
+
+    display_columns = [
+        column
+        for column in ["Original Comment", "Sentiment", "Explanation"]
+        if column in sample_df.columns
+    ]
+
+    sample_rows = sample_df[display_columns].to_string(
+        index=False,
+        max_colwidth=240
+    )
+
+    return f"""
+    Total comments: {total_comments}
+    Sentiment counts: {sentiment_counts}
+    Sentiment percentages: {sentiment_percentages}
+    Dataset scope: {sample_note}
+
+    Representative examples by sentiment:
+    {chr(10).join(sentiment_examples)}
+
+    Analyzed rows:
+    {sample_rows}
+    """
+
+
 # ----------------------------- STATE ---------------------------------------
 if "analysis_df" not in st.session_state:
     st.session_state.analysis_df = None
@@ -468,10 +545,15 @@ st.title("Sentiment Analysis Dashboard")
 try:
     api_key = st.secrets.get("OPENAI_API_KEY", "")
     openai_model = st.secrets.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+    openai_chat_model = st.secrets.get(
+        "OPENAI_CHAT_MODEL",
+        DEFAULT_OPENAI_CHAT_MODEL
+    )
 
 except Exception:
     api_key = ""
     openai_model = DEFAULT_OPENAI_MODEL
+    openai_chat_model = DEFAULT_OPENAI_CHAT_MODEL
 
 if not api_key:
     st.info(
@@ -541,29 +623,43 @@ else:
                 }
             )
 
-            sentiment_counts = df["Sentiment"].value_counts().to_dict()
-            sample_rows = df.head(30).to_string(index=False)
-
-            context = f"""
-            Sentiment counts: {sentiment_counts}
-
-            Sample rows up to 30:
-            {sample_rows}
-            """
+            context = build_chat_analysis_context(df)
+            chat_instructions = (
+                "Eres un senior strategist de social listening, "
+                "brand intelligence y performance creativo. Responde "
+                "en espanol con analisis profundo, accionable y bien "
+                "redactado. Usa exclusivamente los datos entregados, "
+                "pero no seas generico: identifica patrones, matices, "
+                "insights de marca, tension creativa y ejemplos "
+                "textuales. Si el usuario pide sentimiento, estructura "
+                "la respuesta en Sentimiento Positivo, Sentimiento "
+                "Negativo, Sentimiento Neutro y Conclusiones. Cita "
+                "comentarios reales cuando ayuden. No inventes datos."
+            )
+            chat_input = (
+                f"--- DATA ---\n{context}\n--- END DATA ---\n"
+                f"QUESTION: {user_question}"
+            )
 
             try:
                 client = OpenAI(api_key=api_key)
-                response = client.responses.create(
-                    model=openai_model,
-                    instructions=(
-                        "You are an expert business analyst. "
-                        "Answer concisely using only the given data."
-                    ),
-                    input=(
-                        f"--- DATA ---\n{context}\n--- END DATA ---\n"
-                        f"QUESTION: {user_question}"
+
+                try:
+                    response = client.responses.create(
+                        model=openai_chat_model,
+                        instructions=chat_instructions,
+                        input=chat_input
                     )
-                )
+
+                except Exception:
+                    if openai_chat_model == openai_model:
+                        raise
+
+                    response = client.responses.create(
+                        model=openai_model,
+                        instructions=chat_instructions,
+                        input=chat_input
+                    )
 
                 answer = response.output_text.strip()
 
